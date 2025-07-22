@@ -51,8 +51,8 @@ conflicts = [
 
 [tool.uv.sources]
 skyrl-gym = { path = "./skyrl-gym" , editable = true }
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
 
 [project.optional-dependencies]
 deepspeed = [
