@@ -29,6 +29,44 @@ def _get_filesystem(path: str):
         return fsspec.filesystem("file")
 
 
+def join_path(*components) -> str:
+    """
+    Join path components that work correctly with both local paths and cloud URLs.
+
+    For cloud paths (s3://, gs://, gcs://), preserves the protocol and uses / for joining.
+    For local paths, uses os.path.join() for OS compatibility.
+
+    Args:
+        *components: Path components to join
+
+    Returns:
+        str: Joined path
+
+    Examples:
+        join_path("s3://bucket", "folder", "file.txt") -> "s3://bucket/folder/file.txt"
+        join_path("s3://bucket/", "folder", "file.txt") -> "s3://bucket/folder/file.txt"
+        join_path("/local/path", "folder", "file.txt") -> "/local/path/folder/file.txt" (Unix)
+    """
+    if not components:
+        return ""
+
+    base = str(components[0])
+
+    # Check if base path is a cloud URL
+    if is_cloud_path(base):
+        # For cloud paths, use URL-style joining with /
+        # Remove trailing slash from base but preserve the rest of the path structure
+        parts = [base.rstrip("/")]
+        for component in components[1:]:
+            part = str(component).strip("/")
+            if part:  # Skip empty components
+                parts.append(part)
+        return "/".join(parts)
+    else:
+        # For local paths, use os.path.join for OS compatibility
+        return os.path.join(*[str(c) for c in components])
+
+
 def open_file(path: str, mode: str = "rb"):
     """Open a file using fsspec, works with both local and cloud paths."""
     return fsspec.open(path, mode)

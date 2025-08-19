@@ -22,12 +22,85 @@ from skyrl_train.utils.io import (
     download_directory,
     local_work_dir,
     local_read_dir,
+    join_path,
 )
 from skyrl_train.utils.trainer_utils import (
     get_latest_checkpoint_step,
     list_checkpoint_dirs,
     cleanup_old_checkpoints,
 )
+
+
+class TestJoinPath:
+    """Test path joining functionality for both local and cloud paths."""
+
+    def test_join_path_s3_basic(self):
+        """Test basic S3 path joining."""
+        result = join_path("s3://bucket", "folder", "file.txt")
+        assert result == "s3://bucket/folder/file.txt"
+
+    def test_join_path_s3_with_trailing_slash(self):
+        """Test S3 path joining with trailing slash in base."""
+        result = join_path("s3://bucket/", "folder", "file.txt")
+        assert result == "s3://bucket/folder/file.txt"
+
+    def test_join_path_s3_nested(self):
+        """Test S3 path joining with nested folders."""
+        result = join_path("s3://bucket/base", "folder1", "folder2", "file.txt")
+        assert result == "s3://bucket/base/folder1/folder2/file.txt"
+
+    def test_join_path_gcs_basic(self):
+        """Test basic GCS path joining."""
+        result = join_path("gs://bucket", "folder", "file.txt")
+        assert result == "gs://bucket/folder/file.txt"
+
+    def test_join_path_gcs_alternate(self):
+        """Test GCS alternate protocol path joining."""
+        result = join_path("gcs://bucket", "folder", "file.txt")
+        assert result == "gcs://bucket/folder/file.txt"
+
+    def test_join_path_local_unix(self):
+        """Test local Unix path joining."""
+        result = join_path("/home/user", "folder", "file.txt")
+        expected = os.path.join("/home/user", "folder", "file.txt")
+        assert result == expected
+
+    def test_join_path_local_relative(self):
+        """Test local relative path joining."""
+        result = join_path(".", "folder", "file.txt")
+        expected = os.path.join(".", "folder", "file.txt")
+        assert result == expected
+
+    def test_join_path_empty_components(self):
+        """Test path joining with empty components."""
+        result = join_path("s3://bucket", "", "folder", "", "file.txt")
+        assert result == "s3://bucket/folder/file.txt"
+
+    def test_join_path_single_component(self):
+        """Test path joining with single component."""
+        assert join_path("s3://bucket") == "s3://bucket"
+        assert join_path("/local/path") == "/local/path"
+
+    def test_join_path_no_components(self):
+        """Test path joining with no components."""
+        assert join_path() == ""
+
+    def test_join_path_components_with_slashes(self):
+        """Test path joining with components that have slashes."""
+        # For cloud paths, slashes in components should be stripped
+        result = join_path("s3://bucket", "/folder/", "/subfolder/", "file.txt")
+        assert result == "s3://bucket/folder/subfolder/file.txt"
+
+    def test_join_path_checkpoint_scenario(self):
+        """Test realistic checkpoint path scenarios."""
+        base_path = "s3://my-bucket/checkpoints"
+        global_step_dir = join_path(base_path, "global_step_1000")
+        policy_dir = join_path(global_step_dir, "policy")
+        model_file = join_path(policy_dir, "model_world_size_4_rank_0.pt")
+
+        assert global_step_dir == "s3://my-bucket/checkpoints/global_step_1000"
+        assert policy_dir == "s3://my-bucket/checkpoints/global_step_1000/policy"
+        assert model_file == "s3://my-bucket/checkpoints/global_step_1000/policy/model_world_size_4_rank_0.pt"
 
 
 class TestCloudPathDetection:

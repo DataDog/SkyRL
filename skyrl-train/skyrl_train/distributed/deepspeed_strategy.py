@@ -341,7 +341,7 @@ class DeepspeedStrategy(DistributedStrategy):
         # Use our context manager to handle local vs cloud paths
         with io.local_work_dir(output_dir) as work_dir:
             # Create a temporary DS checkpoint folder (only on rank 0)
-            temp_ckpt_dir = os.path.join(work_dir, "temp_deepspeed_ckpt")
+            temp_ckpt_dir = io.join_path(work_dir, "temp_deepspeed_ckpt")
             if rank == 0:
                 os.makedirs(temp_ckpt_dir, exist_ok=True)
             if dist.is_initialized():

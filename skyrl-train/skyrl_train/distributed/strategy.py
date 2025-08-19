@@ -1,5 +1,4 @@
 import random
-import os
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -84,7 +83,7 @@ class DistributedStrategy(ABC):
             ckpt_dir: str - the directory to save the configs to
             tokenizer: AutoTokenizer - tokenizer to save
         """
-        hf_config_tokenizer_path = os.path.join(ckpt_dir, "huggingface")
+        hf_config_tokenizer_path = io.join_path(ckpt_dir, "huggingface")
         io.makedirs(hf_config_tokenizer_path, exist_ok=True)
         model_config = model.config
         generation_config = None

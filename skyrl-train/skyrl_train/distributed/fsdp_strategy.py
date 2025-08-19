@@ -428,9 +428,9 @@ class FSDPStrategy(DistributedStrategy):
         # Define paths for saving individual rank files
         rank = self.get_rank()
         world_size = self.world_size
-        model_path = os.path.join(ckpt_dir, f"model_world_size_{world_size}_rank_{rank}.pt")
-        optim_path = os.path.join(ckpt_dir, f"optim_world_size_{world_size}_rank_{rank}.pt")
-        extra_path = os.path.join(ckpt_dir, f"extra_state_world_size_{world_size}_rank_{rank}.pt")
+        model_path = io.join_path(ckpt_dir, f"model_world_size_{world_size}_rank_{rank}.pt")
+        optim_path = io.join_path(ckpt_dir, f"optim_world_size_{world_size}_rank_{rank}.pt")
+        extra_path = io.join_path(ckpt_dir, f"extra_state_world_size_{world_size}_rank_{rank}.pt")
 
         # Save using appropriate FSDP context
         with warnings.catch_warnings():
@@ -480,7 +480,7 @@ class FSDPStrategy(DistributedStrategy):
             self.save_hf_configs(config_save_model, ckpt_dir, tokenizer)
 
             # Also save runtime FSDP config
-            fsdp_config_path = os.path.join(ckpt_dir, "fsdp_config.json")
+            fsdp_config_path = io.join_path(ckpt_dir, "fsdp_config.json")
             with io.open_file(fsdp_config_path, "w") as f:
                 json.dump({"fsdp_strategy": self.fsdp_strategy, "world_size": self.world_size}, f, indent=4)
 
@@ -518,9 +518,9 @@ class FSDPStrategy(DistributedStrategy):
         # Define paths for loading individual rank files
         rank = self.get_rank()
         world_size = self.world_size
-        model_path = os.path.join(ckpt_dir, f"model_world_size_{world_size}_rank_{rank}.pt")
-        optim_path = os.path.join(ckpt_dir, f"optim_world_size_{world_size}_rank_{rank}.pt")
-        extra_path = os.path.join(ckpt_dir, f"extra_state_world_size_{world_size}_rank_{rank}.pt")
+        model_path = io.join_path(ckpt_dir, f"model_world_size_{world_size}_rank_{rank}.pt")
+        optim_path = io.join_path(ckpt_dir, f"optim_world_size_{world_size}_rank_{rank}.pt")
+        extra_path = io.join_path(ckpt_dir, f"extra_state_world_size_{world_size}_rank_{rank}.pt")
 
         # Check if checkpoint files exist
         if not io.exists(model_path):

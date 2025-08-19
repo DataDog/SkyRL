@@ -1,6 +1,5 @@
 import asyncio
 import math
-import os
 import shutil
 from typing import Any, List, Optional, Dict, Tuple, Union
 from jaxtyping import Float
@@ -1153,9 +1152,9 @@ class RayPPOTrainer:
         Save the model, optimizer, and training states to disk.
         """
         # Create global step folder structure
-        global_step_folder = os.path.join(self.cfg.trainer.ckpt_path, f"global_step_{self.global_step}")
-        policy_save_dir = os.path.join(global_step_folder, "policy")
-        critic_save_dir = os.path.join(global_step_folder, "critic")
+        global_step_folder = io.join_path(self.cfg.trainer.ckpt_path, f"global_step_{self.global_step}")
+        policy_save_dir = io.join_path(global_step_folder, "policy")
+        critic_save_dir = io.join_path(global_step_folder, "critic")
         # TODO(tgriggs): Add reward model checkpointing.
 
         io.makedirs(global_step_folder, exist_ok=True)
@@ -1192,7 +1191,7 @@ class RayPPOTrainer:
                 self.policy_model.backload_to_gpu()
 
         # Save dataloader state
-        dataloader_save_path = os.path.join(global_step_folder, "data.pt")
+        dataloader_save_path = io.join_path(global_step_folder, "data.pt")
         try:
             dataloader_state_dict = self.train_dataloader.state_dict()
             with io.open_file(dataloader_save_path, "wb") as f:
@@ -1206,13 +1205,13 @@ class RayPPOTrainer:
             "global_step": self.global_step,
             "config": self.cfg,
         }
-        trainer_state_path = os.path.join(global_step_folder, "trainer_state.pt")
+        trainer_state_path = io.join_path(global_step_folder, "trainer_state.pt")
         with io.open_file(trainer_state_path, "wb") as f:
             torch.save(trainer_state, f)
         logger.info(f"Saved trainer state to {trainer_state_path}")
 
         # Atomic tracking - write this last after all saves succeed
-        latest_checkpoint_file = os.path.join(self.cfg.trainer.ckpt_path, "latest_ckpt_global_step.txt")
+        latest_checkpoint_file = io.join_path(self.cfg.trainer.ckpt_path, "latest_ckpt_global_step.txt")
         with io.open_file(latest_checkpoint_file, "w") as f:
             f.write(str(self.global_step))
 
@@ -1248,13 +1247,13 @@ class RayPPOTrainer:
             return 0
         # first, let's get resume_path
         elif self.resume_mode == ResumeMode.LATEST:
-            latest_checkpoint_file = os.path.join(self.cfg.trainer.ckpt_path, "latest_ckpt_global_step.txt")
+            latest_checkpoint_file = io.join_path(self.cfg.trainer.ckpt_path, "latest_ckpt_global_step.txt")
             if not io.exists(latest_checkpoint_file):
                 logger.info("No checkpoint found, starting training from scratch")
                 return 0
             with io.open_file(latest_checkpoint_file, "r") as f:
                 ckpt_iteration = int(f.read().strip())
-            checkpoint_path = os.path.join(self.cfg.trainer.ckpt_path, f"{GLOBAL_STEP_PREFIX}{ckpt_iteration}")
+            checkpoint_path = io.join_path(self.cfg.trainer.ckpt_path, f"{GLOBAL_STEP_PREFIX}{ckpt_iteration}")
             # Run validation: Make sure ckpt folder is consistent with latest_ckpt_global_step.txt
             validate_consistency_for_latest_checkpoint(
                 self.cfg.trainer.ckpt_path,
@@ -1289,10 +1288,10 @@ class RayPPOTrainer:
         logger.info(f"Resuming from global_step: {global_step}")
 
         # Define paths for different checkpoint components
-        policy_ckpt_dir = os.path.join(checkpoint_path, "policy")
-        critic_ckpt_dir = os.path.join(checkpoint_path, "critic")
-        trainer_state_path = os.path.join(checkpoint_path, "trainer_state.pt")
-        dataloader_state_path = os.path.join(checkpoint_path, "data.pt")
+        policy_ckpt_dir = io.join_path(checkpoint_path, "policy")
+        critic_ckpt_dir = io.join_path(checkpoint_path, "critic")
+        trainer_state_path = io.join_path(checkpoint_path, "trainer_state.pt")
+        dataloader_state_path = io.join_path(checkpoint_path, "data.pt")
 
         # Validate that required checkpoint files exist
         if not io.exists(trainer_state_path):
@@ -1354,12 +1353,12 @@ class RayPPOTrainer:
         """
         Save the model parameters in HF format at `cfg.trainer.export_path`.
         """
-        policy_export_dir = os.path.join(self.cfg.trainer.export_path, f"global_step_{self.global_step}", "policy")
+        policy_export_dir = io.join_path(self.cfg.trainer.export_path, f"global_step_{self.global_step}", "policy")
         ray.get(
             self.policy_model.async_run_ray_method("pass_through", "save_hf_model", policy_export_dir, self.tokenizer)
         )
         if self.critic_model is not None:
-            critic_export_dir = os.path.join(self.cfg.trainer.export_path, f"global_step_{self.global_step}", "critic")
+            critic_export_dir = io.join_path(self.cfg.trainer.export_path, f"global_step_{self.global_step}", "critic")
             ray.get(
                 self.critic_model.async_run_ray_method(
                     "pass_through", "save_hf_model", critic_export_dir, self.tokenizer
@@ -1376,7 +1375,7 @@ class RayPPOTrainer:
         - after calling this method, the same model placement still holds.
         """
         # TODO(tgriggs): Make policy-to-ref sync faster.
-        policy_export_dir = os.path.join(self.cfg.trainer.export_path, f"global_step_{self.global_step}", "policy")
+        policy_export_dir = io.join_path(self.cfg.trainer.export_path, f"global_step_{self.global_step}", "policy")
         ray.get(
             self.policy_model.async_run_ray_method("pass_through", "save_hf_model", policy_export_dir, self.tokenizer)
         )

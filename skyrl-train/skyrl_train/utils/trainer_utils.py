@@ -97,7 +97,7 @@ def get_latest_checkpoint_step(checkpoint_base_path: str) -> int:
     Returns:
         int: Latest global step, or 0 if no checkpoint found
     """
-    latest_file_path = os.path.join(checkpoint_base_path, "latest_ckpt_global_step.txt")
+    latest_file_path = io.join_path(checkpoint_base_path, "latest_ckpt_global_step.txt")
 
     if not io.exists(latest_file_path):
         return 0
@@ -170,7 +170,7 @@ def cleanup_old_checkpoints(checkpoint_base_path: str, max_checkpoints: int, cur
     dirs_to_remove = checkpoint_dirs[:-max_checkpoints]
 
     for dir_name in dirs_to_remove:
-        full_path = os.path.join(checkpoint_base_path, dir_name)
+        full_path = io.join_path(checkpoint_base_path, dir_name)
         try:
             io.remove(full_path)
             step_num = extract_step(dir_name)
@@ -194,7 +194,7 @@ def validate_consistency_for_latest_checkpoint(
             max_global_step_in_folder = max(global_step_values)
             # NOTE (sumanthrh): We allow a checkpoint folder to be `save_interval` steps ahead of the latest checkpoint in `latest_checkpoint_file`. This is because the last checkpoint can be an incomplete checkpoint.
             if max_global_step_in_folder - ckpt_iteration > save_interval:
-                max_global_step_in_folder_path = os.path.join(
+                max_global_step_in_folder_path = io.join_path(
                     root_ckpt_folder, f"{GLOBAL_STEP_PREFIX}{max_global_step_in_folder}"
                 )
                 raise ValueError(
