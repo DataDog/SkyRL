@@ -21,16 +21,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
       - name: Set up Python
         # This is the version of the action for setting up Python, not the Python version.
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           # Semantic version range syntax or exact version of a Python version
           python-version: '3.12'
           cache: 'pip'
       - name: Install the latest version of uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d9e0f98d3fc6adb07d1e3d37f3043649ddad06a1 # v6.5.0
         with:
           activate-environment: true
       - name: Run pre-commit hooks
@@ -45,16 +45,16 @@ jobs:
         working-directory: ./skyrl-train
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
       - name: Set up Python
         # This is the version of the action for setting up Python, not the Python version.
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           # Semantic version range syntax or exact version of a Python version
           python-version: '3.12'
           cache: 'pip'
       - name: Install the latest version of uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d9e0f98d3fc6adb07d1e3d37f3043649ddad06a1 # v6.5.0
         with:
           activate-environment: true
       - name: Install skyrl-train
@@ -71,16 +71,16 @@ jobs:
         working-directory: ./skyrl-gym
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
       - name: Set up Python
         # This is the version of the action for setting up Python, not the Python version.
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           # Semantic version range syntax or exact version of a Python version
           python-version: '3.12'
           cache: 'pip'
       - name: Install the latest version of uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d9e0f98d3fc6adb07d1e3d37f3043649ddad06a1 # v6.5.0
         with:
           activate-environment: true
       - name: Install skyrl-gym
