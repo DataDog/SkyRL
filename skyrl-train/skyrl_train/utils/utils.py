@@ -1,11 +1,21 @@
 import os
 import time
+import sys
+import logging
+import math
 
 import ray
 import torch
 from loguru import logger
-from omegaconf.dictconfig import DictConfig
-from ray.util.placement_group import PlacementGroup
+from omegaconf import DictConfig, OmegaConf
+from ray.util.placement_group import (
+    placement_group,
+    PlacementGroupSchedulingStrategy,
+    PlacementGroup,
+    placement_group_table,
+)
+
+from .constants import SKYRL_LD_LIBRARY_PATH_EXPORT, SKYRL_RAY_PG_TIMEOUT_IN_S, SKYRL_PYTHONPATH_EXPORT
 
 
 class Timer:
@@ -21,7 +31,7 @@ class Timer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         logger.opt(depth=1).info(f"Finished: '{self.message}', time cost: {time.time() - self.start_time:.2f}s")
         if self.update_dict is not None:
-            self.update_dict[self.message] = time.time() - self.start_time
+            self.update_dict[self.message] = self.update_dict.get(self.message, 0.0) + time.time() - self.start_time
 
     async def __aenter__(self):
         self.start_time = time.time()
@@ -31,7 +41,7 @@ class Timer:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         logger.opt(depth=1).info(f"Finished: '{self.message}', time cost: {time.time() - self.start_time:.2f}s")
         if self.update_dict is not None:
-            self.update_dict[self.message] = time.time() - self.start_time
+            self.update_dict[self.message] = self.update_dict.get(self.message, 0.0) + time.time() - self.start_time
 
 
 def validate_batch_sizes(cfg: DictConfig):
@@ -113,37 +123,59 @@ def validate_batch_sizes(cfg: DictConfig):
             critic_train_batch_size_per_gpu % critic_mini_batch_size_per_gpu == 0
         ), f"normalized critic_train_batch_size_per_gpu (train_batch_size * n_samples_per_prompt // critic_dp_size) {critic_train_batch_size_per_gpu} should be divisible by critic_mini_batch_size_per_gpu (critic_mini_batch_size * n_samples_per_prompt // critic_dp_size) {critic_mini_batch_size_per_gpu}"
 
+    # Validate training batch size is larger than the least common multiple of the DP sizes of policy (and ref if used).
+    lcm_dp_size = policy_dp_size
+
+    use_ref_model = cfg.trainer.algorithm.use_kl_loss or cfg.trainer.algorithm.use_kl_in_reward
+    if use_ref_model:
+        ref_world_size = cfg.trainer.placement.ref_num_nodes * cfg.trainer.placement.ref_num_gpus_per_node
+        ref_dp_size = ref_world_size // cfg.trainer.ref.sequence_parallel_size
+        lcm_dp_size = math.lcm(lcm_dp_size, ref_dp_size)
+
+    assert cfg.trainer.train_batch_size >= lcm_dp_size, (
+        f"train_batch_size ({cfg.trainer.train_batch_size}) should be larger than or equal to the least common multiple of the data parallel sizes of the enabled models: "
+        f"policy_dp_size={policy_dp_size}, "
+        f"ref_dp_size={ref_dp_size if use_ref_model else 'None'}, "
+        f"lcm_dp_size={lcm_dp_size}"
+    )
+
+
+def validate_megatron_cfg(cfg: DictConfig):
+    # not yet supported + tested features
+    assert cfg.generator.weight_sync_backend == "nccl", "only nccl is supported for megatron weight sync"
+    assert cfg.generator.backend == "vllm", "only vllm is supported for with megatron"
+    assert cfg.trainer.placement.colocate_all, "only colocate_all=True is supported for megatron training"
+    assert cfg.trainer.critic.model.path is None, "only GRPO training is currently supported for megatron"
+
+    if cfg.trainer.flash_attn:
+        import flash_attn
+
+        version = flash_attn.__version__
+        if version > "2.7.4.post1":
+            raise ValueError("flash_attn <= 2.7.4.post1 is required for using the megatron backend with flash_attn")
+
+    worker_configs = [(cfg.trainer.policy, "policy"), (cfg.trainer.ref, "ref")]
+    for config, worker_type in worker_configs:
+        # context, expert, and expert tensor parallel are not yet supported for megatron
+        if config.megatron_config.context_parallel_size > 1:
+            assert cfg.trainer.use_sample_packing, "context parallel is only supported with sample packing"
+        # check that sequence parallel is not configured outside of megatron
+        assert (
+            config.sequence_parallel_size == 1
+        ), f"found {worker_type}.sequence_parallel_size={config.sequence_parallel_size}, ulysses style sequence parallel is not supported for megatron"
+
 
 def validate_cfg(cfg: DictConfig):
-    if cfg.generator.max_turns == 1:
-        assert (
-            cfg.generator.max_input_length == cfg.trainer.max_prompt_length
-        ), "generator.max_input_length should be set equal to trainer.max_prompt_length for single-turn generation"
-    else:
-        assert (
-            cfg.generator.max_input_length >= cfg.trainer.max_prompt_length
-        ), "generator.max_input_length should be set greater than or equal to trainer.max_prompt_length for multi-turn generation"
 
-    if not cfg.generator.run_engines_locally:
-        assert cfg.generator.num_inference_engines == len(
-            cfg.generator.remote_inference_engine_urls
-        ), "num_inference_engines should be equal to the number of remote_inference_engine_urls"
+    # Validate generation config separately
+    validate_generator_cfg(cfg)
 
-    if not cfg.generator.async_engine:
-        assert (
-            cfg.generator.batched
-        ), "if we are using the offline engine, we need to put generator in batched mode for faster generation"
-    if cfg.generator.backend == "sglang" and cfg.generator.run_engines_locally:
-        raise ValueError("SGLang backend currently does not support local engines")
+    from .ppo_utils import AdvantageEstimatorRegistry, PolicyLossRegistry
 
     assert (
         cfg.trainer.sequence_parallel_backend == "ulysses"
     ), f"only ulysses is supported as of now, got {cfg.trainer.sequence_parallel_backend}"
 
-    assert cfg.trainer.algorithm.advantage_estimator in (
-        "gae",
-        "grpo",
-    ), f"invalid advantage estimator: {cfg.trainer.algorithm.advantage_estimator}"
     # if advantage estimator is GAE, then critic path should be provided
     if cfg.trainer.algorithm.advantage_estimator == "gae":
         assert (
@@ -169,33 +201,42 @@ def validate_cfg(cfg: DictConfig):
 
     validate_batch_sizes(cfg)
 
-    # tracker
-    if cfg.trainer.logger == "wandb":
-        assert os.environ.get("WANDB_API_KEY"), "`WANDB_API_KEY` is required for `wandb` logger"
-
     if cfg.trainer.max_ckpts_to_keep == 0:
         raise ValueError(
             "`max_ckpts_to_keep` must be greater than 0 to keep the last N checkpoints or negative to keep all checkpoints"
         )
 
-    # resolve override_existing_update_group
-    if cfg.generator.override_existing_update_group == "auto":
-        if cfg.generator.backend == "vllm" and not cfg.generator.run_engines_locally:
-            # remote engines can be launched separately so we `enable` by default
-            cfg.generator.override_existing_update_group = "enable"
-        else:
-            # for local engines or sglang, we disable
-            cfg.generator.override_existing_update_group = "disable"
+    assert (
+        cfg.trainer.algorithm.policy_loss_type in PolicyLossRegistry.list_available()
+    ), f"invalid policy_loss_type: {cfg.trainer.algorithm.policy_loss_type}. Must be one of {PolicyLossRegistry.list_available()}"
 
-    assert cfg.trainer.algorithm.ppo_loss_type in (
-        "regular",
-        "dual_clip",
-    ), f"invalid ppo_loss_type: {cfg.trainer.algorithm.ppo_loss_type}. Must be one of `['regular', 'dual_clip']`"
+    assert (
+        cfg.trainer.algorithm.advantage_estimator in AdvantageEstimatorRegistry.list_available()
+    ), f"invalid advantage_estimator: {cfg.trainer.algorithm.advantage_estimator}. Must be one of {AdvantageEstimatorRegistry.list_available()}"
 
     assert cfg.trainer.algorithm.loss_reduction in (
         "token_mean",
         "sequence_mean",
-    ), f"invalid loss_reduction: {cfg.trainer.algorithm.loss_reduction}. Must be one of `['token_mean', 'sequence_mean']`"
+        "seq_mean_token_sum_norm",
+    ), f"invalid loss_reduction: {cfg.trainer.algorithm.loss_reduction}. Must be one of `['token_mean', 'sequence_mean', 'seq_mean_token_sum_norm']`"
+
+    # add field to algorithm config needed for loss functions
+    # create a new config to make it modifiable
+    algorithm_config = OmegaConf.create(cfg.trainer.algorithm)
+    # NOTE (erictang000): this is the max sequence length including the prompt, since max response length
+    # per batch can be variable based on the prompt length. This is used to normalize the loss for
+    # seq_mean_token_sum_norm loss reduction. Potentially revisit this if we update to use a
+    # fixed max response budget.
+    algorithm_config.max_seq_len = cfg.generator.max_input_length + cfg.generator.sampling_params.max_generate_length
+
+    # TODO (erictang000): remove these after deprecation period
+    if algorithm_config.use_abs_kl:
+        logger.warning("`use_abs_kl` will be deprecated, overriding to use `kl_estimator_type='abs'` instead")
+        algorithm_config.kl_estimator_type = "abs"
+    elif algorithm_config.use_kl_estimator_k3:
+        logger.warning("`use_kl_estimator_k3` will be deprecated, overriding to use `kl_estimator_type='k3'` instead")
+        algorithm_config.kl_estimator_type = "k3"
+    cfg.trainer.algorithm = algorithm_config
 
     if cfg.trainer.strategy == "deepspeed" and not (
         cfg.trainer.policy.optimizer_config.offload_after_step
@@ -205,8 +246,150 @@ def validate_cfg(cfg: DictConfig):
             "`offload_after_step=False` is not supported for DeepSpeed, please set `offload_after_step` to `true` for both policy and critic"
         )
 
+    if cfg.trainer.algorithm.use_tis:
+        if cfg.trainer.algorithm.tis_imp_ratio_cap <= 0:
+            raise ValueError(
+                f"If `trainer.algorithm.use_tis` is `True` then `cfg.trainer.algorithm.tis_imp_ratio_cap` should be > 0, got {cfg.trainer.algorithm.tis_imp_ratio_cap }"
+            )
+        if cfg.generator.sampling_params.logprobs is None:
+            logger.warning(
+                "`generator.sampling_params.logprobs` is `None` but `trainer.algorithm.use_tis` is `True`. Setting `logprobs` to `True`."
+            )
+            # just set to 0 for better user exp
+            cfg.generator.sampling_params.logprobs = 0
+
+        if cfg.generator.backend == "sglang":
+            raise NotImplementedError("`trainer.algorithm.use_tis` doesn't support Sglang backend, please use vLLM")
+
+        if not cfg.generator.batched:
+            raise ValueError(
+                "Gneration with `trainer.algorithm.use_tis` needs to be batched with only single turn generation"
+            )
+
+    if cfg.trainer.policy.model.lora.rank > 0:
+        # LoRA enabled
+        # Right now: assert generator backend must be vllm, training backend must be fsdp/fsdp2
+        assert cfg.generator.backend == "vllm", "LoRA enabled requires vLLM backend"
+        assert cfg.trainer.strategy in ("fsdp", "fsdp2"), "LoRA enabled requires fsdp/fsdp2 training backend"
+
+
+def validate_generator_cfg(cfg: DictConfig):
+    """Validates the correctness of generator-related config.
+
+    Args:
+        cfg (DictConfig): config to validate
+
+    Raises:
+        NotImplementedError: if feature is not supported, such as sglang for multiturn generation
+        ValueError: when cfg.generator.sampling_params.logprobs > 0
+    """
+
+    if cfg.generator.max_turns == 1:
+        assert (
+            cfg.generator.max_input_length == cfg.trainer.max_prompt_length
+        ), "generator.max_input_length should be set equal to trainer.max_prompt_length for single-turn generation"
+    else:
+        assert (
+            cfg.generator.max_input_length >= cfg.trainer.max_prompt_length
+        ), "generator.max_input_length should be set greater than or equal to trainer.max_prompt_length for multi-turn generation"
+
+    if not cfg.generator.run_engines_locally:
+        assert cfg.generator.num_inference_engines == len(
+            cfg.generator.remote_inference_engine_urls
+        ), "num_inference_engines should be equal to the number of remote_inference_engine_urls"
+
+    if not cfg.generator.async_engine and cfg.generator.backend == "vllm":
+        assert (
+            cfg.generator.batched
+        ), "if we are using the offline vLLM engine, we need to put generator in batched mode for faster generation"
+
+    # TODO(tgriggs): use a more modular config validation
+    if cfg.trainer.logger == "wandb":
+        assert os.environ.get("WANDB_API_KEY"), "`WANDB_API_KEY` is required for `wandb` logger"
+
+    if cfg.generator.override_existing_update_group == "auto":
+        if cfg.generator.backend == "vllm" and not cfg.generator.run_engines_locally:
+            # remote engines can be launched separately so we `enable` by default
+            cfg.generator.override_existing_update_group = "enable"
+        else:
+            # for local engines or sglang, we disable
+            cfg.generator.override_existing_update_group = "disable"
+
+    # TODO: fix once we support these features with SGLang
+    if cfg.generator.backend == "sglang" and cfg.generator.run_engines_locally:
+        assert cfg.generator.inference_engine_tensor_parallel_size == 1, (
+            "As of now, We do not support tensor parallel inference engine with SGLang when running engines locally. "
+            "Please set `inference_engine_tensor_parallel_size` to 1."
+        )
+
     if cfg.generator.backend == "sglang" and not cfg.generator.use_conversation_multi_turn:
         raise NotImplementedError("`use_conversation_multi_turn=False` is not supported for SGLang backend")
+
+    if cfg.generator.sampling_params.logprobs is not None:
+        assert isinstance(cfg.generator.sampling_params.logprobs, int)
+        if cfg.generator.sampling_params.logprobs > 0:
+            raise ValueError(
+                f"`logprobs` if set should be 0 i.e only for the chosen token, got {cfg.generator.sampling_params.logprobs}"
+            )
+        if not cfg.generator.batched:
+            raise NotImplementedError(
+                "Async generation with `generator.batched=false` doesn't support `sampling_params.logprobs`"
+            )
+        if not cfg.generator.run_engines_locally:
+            raise NotImplementedError("Remote inference mode doesn't support `sampling_params.logprobs`")
+
+    if cfg.trainer.strategy == "megatron":
+        validate_megatron_cfg(cfg)
+    if cfg.generator.backend == "sglang":
+        # Some sampling parameters are not supported in SGLang when `skip_tokenizer_init` is True.
+        if cfg.generator.sampling_params.stop is not None or cfg.generator.eval_sampling_params.stop is not None:
+            raise ValueError(
+                "`sampling_params.stop` and `eval_sampling_params.stop` are not supported for SGLang backend "
+                "since we always set `skip_tokenizer_init` to True. If you have to use these parameters, you can switch to vLLM. "
+                "See this issue for more: https://github.com/sgl-project/sglang/issues/9039#issuecomment-3218331087"
+            )
+        if "min_new_tokens" in cfg.generator.sampling_params or "min_new_tokens" in cfg.generator.eval_sampling_params:
+            raise ValueError(
+                "`sampling_params.min_new_tokens` and `eval_sampling_params.min_new_tokens` are not "
+                "supported for SGLang backend since we always set `skip_tokenizer_init` to True. "
+                "If you have to use these parameters, you can switch to vLLM. "
+                "See this issue for more: https://github.com/sgl-project/sglang/issues/9039#issuecomment-3218331087"
+            )
+
+    if cfg.generator.use_conversation_multi_turn:
+        if (
+            cfg.generator.sampling_params.stop is not None or cfg.generator.eval_sampling_params.stop is not None
+        ) and not cfg.generator.append_eos_token_after_stop_str_in_multi_turn:
+            logger.warning(
+                "WARNING: `sampling_params.stop` and `eval_sampling_params.stop` are specified and we "
+                "are using multi-turn generation. You might want to set `append_eos_token_after_stop_str_in_multi_turn` "
+                "to `True` to append tokenizer.eos_token_id to the assistant-generated response to match the chat template."
+            )
+
+    if cfg.generator.enable_http_endpoint:
+        if cfg.generator.backend == "sglang":
+            # TODO(Charlie): sglang_server.py not supported for /chat/completion yet because we have
+            # skip_tokenizer_init=True in engine creation. Fix by getting tokens via return logprobs
+            # instead. sglang_engine.py not supported yet because we still need to figure out how
+            # to make SGLang Python engine take OAI request.
+            raise ValueError(
+                'generator.enable_http_endpoint is not supported for SGLang backend yet. Please set generator.backend="vllm".'
+            )
+        if not cfg.generator.async_engine:
+            raise ValueError("generator.async_engine must be True when generator.enable_http_endpoint==True.")
+
+    # Validate inference engine parallelism.
+    ep_size = cfg.generator.inference_engine_expert_parallel_size
+    dp_size = cfg.generator.inference_engine_data_parallel_size
+    tp_size = cfg.generator.inference_engine_tensor_parallel_size
+    if cfg.generator.backend == "sglang":
+        assert dp_size == 1, "Inference data parallelism is not yet supported for SGLang backend."
+        assert ep_size == 1, "Inference expert parallelism is not yet supported for SGLang backend."
+    if ep_size > 1:
+        assert dp_size * tp_size == ep_size, (
+            f"If inference expert parallel is enabled, data parallel size * tensor parallel size must equal expert parallel size. "
+            f"Got dp_size={dp_size}, tp_size={tp_size}, ep_size={ep_size}"
+        )
 
 
 @ray.remote
@@ -247,13 +430,46 @@ def get_physical_gpu_id():
     return str(props.uuid)
 
 
-def initialize_ray(cfg: DictConfig):
+def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
+    """
+    Prepare environment variables for Ray runtime environment.
+
+    Args:
+        cfg: Training config
+
+    Returns:
+        Dict[str, str]: Environment variables to be used in Ray runtime environment
+    """
     # TODO(sumanthrh): introduce a debug mode and add debugging flags like `CUDA_LAUNCH_BLOCKING` here
     env_vars = {}
+
+    # NOTE (charlie): See https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
+    # and https://docs.vllm.ai/en/v0.9.2/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
+    # Same for SGLang as we set `NCCL_CUMEM_ENABLE` to 0 in `sglang_engine.py`'s _patched_set_envs_and_config
+    if cfg.generator.weight_sync_backend == "nccl":
+        env_vars["NCCL_CUMEM_ENABLE"] = "0"
+
+    if cfg.trainer.strategy == "megatron":
+        # useful when tp > 1 (and thus megatron sequence_parallel is enabled)
+        # see: https://github.com/NVIDIA/Megatron-LM/issues/533#issuecomment-1760193239
+        env_vars["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+        if cfg.trainer.flash_attn:
+            # disable fused attention for megatron with flash_attn (otherwise flash_attn choice is overridden in TransformerEngine for Hopper+ devices)
+            # https://github.com/NVIDIA/TransformerEngine/blob/release_v2.5/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L916
+            env_vars["NVTE_FUSED_ATTN"] = "0"
+
     if cfg.generator.backend == "vllm":
+        env_vars["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "true"
+
         # NOTE (sumanthrh): In vllm >= 0.9.0, we need to explicitly allow for serialization via pickle for collective RPCs.
         # During weight transfer, we use IPC handles, which contains a `function` object and requires pickling.
         env_vars["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
+        # NOTE (sumanthrh): In vLLM >= 0.9.0, we've observed compilatiion failures with torch compile. removing the compilation directory and trying
+        # again does not fix the issue. Temporarily we disable compilation cache, which seems to fix the issue.
+        # This should not have any effect on performance - compilation will still happen, it's just not cached
+        # TODO (sumanthrh): remove this once vLLM fixes the issue
+        env_vars["VLLM_DISABLE_COMPILE_CACHE"] = "1"
 
         if not os.environ.get("VLLM_USE_V1", False):
             logger.info(
@@ -262,18 +478,109 @@ def initialize_ray(cfg: DictConfig):
             env_vars["VLLM_USE_V1"] = "1"
             env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
+    # Use max of available GPU counts, defaulting to 1 if none found
+    gpu_counts = []
+    if hasattr(cfg.generator, "inference_engine_tensor_parallel_size"):
+        gpu_counts.append(cfg.generator.inference_engine_tensor_parallel_size)
+    if hasattr(cfg, "trainer") and hasattr(cfg.trainer, "placement"):
+        placement = cfg.trainer.placement
+        gpu_counts.extend(
+            [
+                placement.policy_num_gpus_per_node,
+                placement.critic_num_gpus_per_node,
+                placement.ref_num_gpus_per_node,
+            ]
+        )
+    max_num_gpus_per_node = max(gpu_counts) if gpu_counts else 1
+    if not peer_access_supported(max_num_gpus_per_node=max_num_gpus_per_node):
+        logger.info("Peer access is not supported on this node type, disabling NCCL P2P and SHM")
+        env_vars["NCCL_P2P_DISABLE"] = "1"
+        env_vars["NCCL_SHM_DISABLE"] = "1"
+
     # TODO: this can be removed if we standardize on env files.
     # But it's helpful for a quickstart
     if os.environ.get("WANDB_API_KEY"):
         logger.info("Exporting wandb api key to ray runtime env")
         env_vars["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
 
-    if os.environ.get("SKYRL_LD_LIBRARY_PATH_EXPORT"):
+    if os.environ.get("MLFLOW_TRACKING_URI"):
+        logger.info("Exporting mlflow tracking uri to ray runtime env")
+        env_vars["MLFLOW_TRACKING_URI"] = os.environ["MLFLOW_TRACKING_URI"]
+
+    if os.environ.get("MLFLOW_TRACKING_TOKEN"):
+        logger.info("Exporting mlflow tracking token to ray runtime env")
+        env_vars["MLFLOW_TRACKING_TOKEN"] = os.environ["MLFLOW_TRACKING_TOKEN"]
+
+    if SKYRL_LD_LIBRARY_PATH_EXPORT:
         # export `LD_LIBRARY_PATH` to ray runtime env.
         # For some reason the `LD_LIBRARY_PATH` is not exported to the worker with .env file.
         logger.info(f"Exporting `LD_LIBRARY_PATH` to ray runtime env: {os.environ['LD_LIBRARY_PATH']}")
         env_vars["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+
+    if SKYRL_PYTHONPATH_EXPORT:
+        # allow pythonpath to be updated as a fall back for deps that are not shipped with UV
+        # this is useful for dependencies that are baked into the docker image but that we don't want to ship + rebuild with UV (i.e. TransformerEngine)
+        # see https://github.com/ray-project/ray/issues/56697 for why this is needed
+        # note that this could potentially cause unexpected issues if there are overlapping installations between the base image
+        # and the pyproject.toml file - to resolve these, make sure to specify exact versions of dependencies in the pyproject.toml
+        logger.info(f"Exporting `PYTHONPATH` to ray runtime env: {os.environ['PYTHONPATH']}")
+        env_vars["PYTHONPATH"] = os.environ["PYTHONPATH"]
+
+    return env_vars
+
+
+def configure_ray_worker_logging() -> None:
+    """
+    In Ray workers, stderr/stdout are not TTYs, so Loguru disables color.
+    This method forces color and formatting (e.g., bold) and routes stdlib `logging`
+    through Loguru so third-party logs match formatting
+    """
+    # 1) Loguru formatting (force colors)
+    logger.remove()
+    logger.level("INFO", color="<bold><green>")
+    logger.add(
+        sys.stderr,
+        colorize=True,  # keep ANSI even without a TTY
+        enqueue=True,
+        backtrace=False,
+        diagnose=False,
+        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+        "<level>{message}</level>",
+    )
+
+    # 2) Route stdlib logging -> Loguru (so vLLM/transformers/etc. are formatted)
+    class _InterceptHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            try:
+                level = logger.level(record.levelname).name
+            except ValueError:
+                level = record.levelno
+            logger.opt(depth=6, exception=record.exc_info).log(level, record.getMessage())
+
+    logging.root.handlers = [_InterceptHandler()]
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.root.setLevel(level)
+
+
+def initialize_ray(cfg: DictConfig):
+    """
+    Initialize Ray cluster with prepared runtime environment.
+
+    Args:
+        cfg: Training config
+    """
+    from .ppo_utils import (
+        sync_registries,
+    )
+
+    env_vars = prepare_runtime_environment(cfg)
     ray.init(runtime_env={"env_vars": env_vars})
+
+    # create the named ray actors for the registries to make available to all workers
+    sync_registries()
 
 
 def get_ray_pg_ready_with_timeout(pg: PlacementGroup, timeout: int = 60):
@@ -291,6 +598,44 @@ def get_ray_pg_ready_with_timeout(pg: PlacementGroup, timeout: int = 60):
             f"This might indicate insufficient GPU resources.\n"
             f"Error: {e}"
         )
+
+
+@ray.remote(num_gpus=1)
+class InfoActor:
+    def get_gpu_id(self):
+        return ray.get_gpu_ids()[0]
+
+
+def get_reordered_bundle_indices(pg: PlacementGroup):
+    pg_data = placement_group_table(pg)
+    num_bundles = len(pg_data["bundles"])
+    bundle_to_node_ids = pg_data["bundles_to_node_id"]
+
+    # use info actor to get the GPU id
+    info_actors = []
+    for i in range(num_bundles):
+        info_actors.append(
+            InfoActor.options(
+                num_cpus=0.01,  # set both num_cpus and num_gpus to be small values to enable assignment in colocated case
+                num_gpus=0.01,
+                resources=None,
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=i,
+                ),
+            ).remote()
+        )
+
+    gpu_ids = ray.get([actor.get_gpu_id.remote() for actor in info_actors])
+    for actor in info_actors:
+        ray.kill(actor)
+
+    # original index, node_id, gpu_id
+    bundle_infos = [(i, bundle_to_node_ids[i], gpu_ids[i]) for i in range(num_bundles)]
+    pg_reordered_bundle_indices = [
+        bundle_info[0] for bundle_info in sorted(bundle_infos, key=lambda x: (x[1], x[2]))
+    ]  # sort by node_id, then gpu_id
+    return pg_reordered_bundle_indices
 
 
 # NOTE (sumanthrh): For SGLang, the string representations here should also match those used by (and supported by) SGLang.
@@ -323,9 +668,61 @@ def format_gib(mem_bytes: int) -> str:
 
 
 def print_mem(tag: str, mem: dict):
-    print(
+    logger.info(
         f"{tag} - Allocated: {format_gib(mem['allocated'])}, "
         f"Reserved: {format_gib(mem['reserved'])}, "
         f"Free: {format_gib(mem['free'])}, "
         f"Total: {format_gib(mem['total'])}"
     )
+
+
+def run_p2p_access_check():
+    device_count = torch.cuda.device_count()
+    if device_count < 2:
+        return False
+
+    # Check P2P access between all GPU pairs
+    for i in range(device_count):
+        for j in range(device_count):
+            if i != j:
+                # This checks if device i can access device j's memory
+                can_access = torch.cuda.can_device_access_peer(i, j)
+                if not can_access:
+                    return False
+
+    return True
+
+
+def peer_access_supported(max_num_gpus_per_node: int):
+    # whatever the max num gpus per node is, we can check p2p access if there are at least 2 GPUs
+    # if max is 1, p2p access is not supported
+    if max_num_gpus_per_node <= 1:
+        return False
+
+    if not torch.cuda.is_available():
+        # we are on cpu head node, so we need to check P2P access on a node with 2 GPUs
+        ray.init()
+        pg = placement_group([{"CPU": 1, "GPU": 2}], strategy="PACK")
+        get_ray_pg_ready_with_timeout(pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
+        result = ray.get(
+            ray.remote(num_gpus=2, scheduling_strategy=PlacementGroupSchedulingStrategy(pg))(
+                run_p2p_access_check
+            ).remote()
+        )
+        ray.shutdown()
+        return result
+    else:
+        return run_p2p_access_check()
+
+
+def update_model_config(module_config, override_config_kwargs):
+    """Update the module config with the override_config_kwargs.
+    Args:
+        module_config: The module config from Huggingface Transformers.
+        override_config_kwargs: The kwargs to override the module config.
+    """
+    for key, val in override_config_kwargs.items():
+        if isinstance(val, dict):
+            update_model_config(getattr(module_config, key), val)
+        else:
+            setattr(module_config, key, val)

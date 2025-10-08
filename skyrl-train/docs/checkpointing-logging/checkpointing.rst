@@ -3,6 +3,8 @@ Checkpointing
 
 SkyRL provides checkpointing features to resume training from a previous state. Training state is saved at regular intervals and provides flexible configuration options for checkpoint management.
 
+Checkpointed state can be stored in the local file system or uploaded to cloud storage (S3, GCP).
+
 What State is Saved
 -------------------
 
@@ -23,29 +25,85 @@ Directory Structure
 
 The checkpointing directory structure depends on the training backend used. 
 
+FSDP Checkpointing
+~~~~~~~~~~~~~~~~~~~~
+
 FSDP checkpoints are organized according to the following directory hierarchy:
 
 .. code-block::
 
     {ckpt_path}/
-    ├── latest_ckpt_global_step.txt           # Holds the global step of the latest checkpoint
-    ├── global_step_10/                       # Checkpoint at training step 10
+    ├── latest_ckpt_global_step.txt          # Holds the global step of the latest checkpoint
+    ├── global_step_10/                      # Checkpoint at training step 10
     │   ├── policy/                          # Policy model checkpoint directory
+    │   │   ├── fsdp_config.json             # stores fsdp version and world size
+    │   │   ├── huggingface/                  # HuggingFace config and tokenizer
+    │   │       ├── config.json                 # model config
+    │   │       ├── tokenizer_config.json       # tokenizer config
+    │   │       ├── generation_config.json      # generation config
+    │   │       ├── ...                         # other tokenizer config files
     │   │   ├── model_state.pt               # Model parameters
     │   │   ├── optimizer_state.pt           # Optimizer state
     │   │   └── lr_scheduler_state.pt        # Learning rate scheduler state
     │   ├── critic/                          # Critic model checkpoint (if enabled)
+    │   │   ├── fsdp_config.json             
+    │   │   ├── huggingface/
     │   │   ├── model_state.pt
     │   │   ├── optimizer_state.pt
     │   │   └── lr_scheduler_state.pt
     │   ├── data.pt                          # Dataloader state
     │   └── trainer_state.pt                 # High-level trainer state
-    ├── global_step_20/                       # Checkpoint at training step 20
+    ├── global_step_20/                      # Checkpoint at training step 20
     │   └── ...
-    └── global_step_30/                       # Checkpoint at training step 30
+    └── global_step_30/                      # Checkpoint at training step 30
         └── ...
 
-DeepSpeed checkpoints follow a similar directory structure but the files under ``policy`` and ``critic`` are created by the DeepSpeed checkpoint API, and are not explicitly managed by SkyRL.
+.. _megatron-checkpointing:
+
+Megatron Checkpointing
+~~~~~~~~~~~~~~~~~~~~~~
+
+Megatron checkpoints are handled by the Megatron `dist_checkpointing <https://docs.nvidia.com/megatron-core/developer-guide/latest/api-guide/dist_checkpointing.html>`_ library to perform checkpointing in parallel across ranks. 
+This comes with support for reloading checkpoints in a different parallelism scheme than the one they were saved in.
+
+.. code-block::
+
+    {ckpt_path}/
+    ├── latest_ckpt_global_step.txt          # Holds the global step of the latest checkpoint
+    ├── global_step_10/                      # Checkpoint at training step 10
+    │   ├── policy/                          # Policy model checkpoint directory
+    │   │   ├── metadata.json                # Megatron checkpoint metadata
+    │   │   ├── huggingface/                 # HuggingFace config and tokenizer
+    │   │   ├── __0_0.distcp                 # Megatron checkpoint files
+    │   │   ├── __0_1.distcp                 
+    │   │   └── ...
+    ├── global_step_20/                      # Checkpoint at training step 20
+    │   └── ...
+    └── global_step_30/                      # Checkpoint at training step 30
+        └── ...
+
+DeepSpeed Checkpointing
+~~~~~~~~~~~~~~~~~~~~~~~
+
+DeepSpeed checkpoints follow a similar directory structure but the model checkpoint files under ``policy`` and ``critic`` are created by the DeepSpeed checkpoint API, and are not explicitly managed by SkyRL.
+
+.. code-block::
+
+    {ckpt_path}/
+    ├── latest_ckpt_global_step.txt          # Holds the global step of the latest checkpoint
+    ├── global_step_10/                      # Checkpoint at training step 10
+    │   ├── policy/                          # Policy model checkpoint directory
+    │   │   ├── huggingface/                 # HuggingFace config and tokenizer 
+    │   │   ├── global_step10/               # Deepspeed checkpoint directory
+    │   │   ├── ...                          # other deepspeed checkpointing files
+    │   ├── critic/                          # Critic model checkpoint (if enabled)
+    │   │   ├── huggingface/                 
+    │   │   ├── global_step10/               
+    │   │   ├── ...                          
+    ├── global_step_20/                      # Checkpoint at training step 20
+    │   └── ...
+    └── global_step_30/                      # Checkpoint at training step 30
+        └── ...
 
 
 Key Configuration Parameters
@@ -62,6 +120,9 @@ Checkpointing behavior is controlled by several parameters in the YAML configura
 ``ckpt_path``
   - **Default**: ``"${oc.env:HOME}/ckpts/"``
   - **Purpose**: Base directory where all checkpoints are stored
+  - **Options**:
+    - Local file system path (e.g., ``/path/to/ckpts/``)
+    - Cloud storage path (S3, GCP) (e.g., ``s3://path/to/ckpts/``)
 
 **Checkpoint Cleanup**
 

@@ -32,7 +32,7 @@ Each dataset entry is a dictionary with the following required (and some optiona
        },
    }
 
-We load the dataset as a huggingface `DatasetDict <https://huggingface.co/docs/datasets/en/package_reference/main_classes#datasets.DatasetDict>`_.
+SkyRL supports loading datasets of this format from a local parquet file, a json file, or by Hugging Face dataset name that SkyRL will download. We load the dataset as a huggingface `DatasetDict <https://huggingface.co/docs/datasets/en/package_reference/main_classes#datasets.DatasetDict>`_. 
 
 **Key Requirements:**
 
@@ -100,6 +100,30 @@ Then, the mapping function is called on each sample in the dataset, and the fina
   train_dataset = input_dataset.map(function=make_map_fn("train"), with_indices=True)
   train_dataset.to_parquet(os.path.join(args.output, "train.parquet"))
 
+Note, however, that SkyRL can also load datasets from a local json file or by Hugging Face dataset name.
+
+Using Dataset to Train
+----------------------
+
+With your correctly formatted datasets, you can pass the dataset file paths to the training script:
+
+.. code-block:: bash
+
+  # Dataset file paths
+  uv run -m skyrl_train.entrypoints.main_base \
+    data.train_data="['path/to/train.parquet']" \
+    data.val_data="['path/to/validation.parquet']" \
+
+or specify HuggingFace dataset(s) prepared in the expected format:
+
+.. code-block:: bash
+
+  # Huggingface dataset
+  uv run -m skyrl_train.entrypoints.main_base \
+    data.train_data="['username/my_dataset:train']" \
+    data.val_data="['username/my_dataset:validation']" \
+
+
 
 Reference Scripts
 -----------------
@@ -107,4 +131,4 @@ Reference Scripts
 Use the following scripts as a template to prepare your dataset:
 
 - `gsm8k_dataset.py <https://github.com/NovaSky-AI/SkyRL/blob/main/skyrl-train/examples/gsm8k/gsm8k_dataset.py>`_
-- `synsql_dataset.py <https://github.com/NovaSky-AI/SkyRL/blob/main/skyrl-train/examples/text_to_sql/sql_dataset.py>`_
+- `multiply_dataset.py <https://github.com/NovaSky-AI/SkyRL/blob/main/skyrl-train/examples/multiply/multiply_dataset.py>`_

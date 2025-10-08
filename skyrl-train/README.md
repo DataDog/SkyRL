@@ -20,7 +20,7 @@
 ## Key Features
 The `skyrl-train` package supports:
 - PPO and GRPO
-- Training Backends: FSDP, FSDP2, and DeepSpeed
+- Training Backends: FSDP, FSDP2, Megatron, and DeepSpeed
 - Inference backends: vLLM, SGLang, and any custom OpenAI API compatible endpoint that exposes a method to perform weight sync
 - Ulysses sequence parallelism for long-context training
 - Colocated or disaggregated training and generation (including on heterogeneous hardware)
@@ -45,7 +45,7 @@ The only requirements are:
 - CUDA version 12.8
 - [uv](https://docs.astral.sh/uv/)
 
-If you're running on an existing Ray cluster, make sure to use Ray 2.44.0 and Python 3.12. If not, proceed with the installation instructions below.
+If you're running on an existing Ray cluster, make sure to use Ray 2.48.0 and Python 3.12. If not, proceed with the installation instructions below.
 
 
 First, clone the repository:

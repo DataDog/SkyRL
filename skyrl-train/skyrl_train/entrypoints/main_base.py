@@ -1,12 +1,10 @@
 """
-
-uv run --isolated --extra vllm -m skyrl_train.entrypoints.main_base
-
+Main entrypoint for training.
 """
 
 from ray.util.placement_group import placement_group, PlacementGroup
 
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from skyrl_train.dataset import PromptDataset
 from skyrl_train.utils import validate_cfg
 
@@ -14,7 +12,7 @@ from skyrl_train.trainer import RayPPOTrainer
 from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
 from skyrl_train.inference_engines.remote_inference_engine import create_remote_inference_engines
 from skyrl_train.utils.utils import initialize_ray, get_ray_pg_ready_with_timeout
-from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
+from skyrl_train.utils.constants import SKYRL_RAY_PG_TIMEOUT_IN_S
 from skyrl_train.generators.base import GeneratorInterface
 from omegaconf import OmegaConf, DictConfig
 from pathlib import Path
@@ -36,38 +34,51 @@ config_dir = str(Path(__file__).parent.parent / "config")
 __all__ = ["BasePPOExp", "config_dir"]
 
 
-def create_ray_wrapped_inference_engines_from_config(cfg: DictConfig, colocate_pg, tokenizer):
+def create_ray_wrapped_inference_engines_from_config(cfg: DictConfig, colocate_pg, tokenizer: PreTrainedTokenizerBase):
     from skyrl_train.inference_engines.ray_wrapped_inference_engine import create_ray_wrapped_inference_engines
 
-    return create_ray_wrapped_inference_engines(
-        num_inference_engines=cfg.generator.num_inference_engines,
-        tensor_parallel_size=cfg.generator.inference_engine_tensor_parallel_size,
-        model_dtype=cfg.generator.model_dtype,
-        pretrain=cfg.trainer.policy.model.path,
-        seed=cfg.trainer.seed,
-        vllm_v1_disable_multiproc=cfg.generator.vllm_v1_disable_multiproc,
-        enable_prefix_caching=cfg.generator.enable_prefix_caching,
-        enforce_eager=cfg.generator.enforce_eager,
-        max_model_len=cfg.generator.max_input_length + cfg.generator.sampling_params.max_generate_length,
-        shared_pg=colocate_pg,
-        gpu_memory_utilization=cfg.generator.gpu_memory_utilization,
-        vllm_enable_sleep=cfg.trainer.placement.colocate_all,
-        async_engine=cfg.generator.async_engine,
-        max_num_batched_tokens=cfg.generator.max_num_batched_tokens,
-        max_num_seqs=cfg.generator.max_num_seqs,
-        sampling_params=get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params),
-        tokenizer=tokenizer,
-    )
+    engine_kwargs = {
+        "num_inference_engines": cfg.generator.num_inference_engines,
+        "tensor_parallel_size": cfg.generator.inference_engine_tensor_parallel_size,
+        "model_dtype": cfg.generator.model_dtype,
+        "pretrain": cfg.trainer.policy.model.path,
+        "seed": cfg.trainer.seed,
+        "vllm_v1_disable_multiproc": cfg.generator.vllm_v1_disable_multiproc,
+        "enable_prefix_caching": cfg.generator.enable_prefix_caching,
+        "enforce_eager": cfg.generator.enforce_eager,
+        "expert_parallel_size": cfg.generator.inference_engine_expert_parallel_size,
+        "data_parallel_size": cfg.generator.inference_engine_data_parallel_size,
+        "shared_pg": colocate_pg,
+        "gpu_memory_utilization": cfg.generator.gpu_memory_utilization,
+        "inference_engine_enable_sleep": cfg.trainer.placement.colocate_all,
+        "async_engine": cfg.generator.async_engine,
+        "max_num_batched_tokens": cfg.generator.max_num_batched_tokens,
+        "max_num_seqs": cfg.generator.max_num_seqs,
+        "tokenizer": tokenizer,
+        "backend": cfg.generator.backend,
+        "engine_init_kwargs": cfg.generator.engine_init_kwargs,
+    }
+
+    # Conditionally add LoRA parameters if LoRA is enabled
+    if cfg.trainer.policy.model.lora.rank > 0:
+        engine_kwargs["enable_lora"] = True
+        engine_kwargs["max_lora_rank"] = cfg.trainer.policy.model.lora.rank
+        engine_kwargs["sleep_level"] = 1
+        engine_kwargs["max_loras"] = 1
+
+    return create_ray_wrapped_inference_engines(**engine_kwargs)
 
 
-def create_remote_inference_engines_from_config(cfg: DictConfig):
+def create_remote_inference_engines_from_config(cfg: DictConfig, tokenizer: PreTrainedTokenizerBase):
     # TODO(tgriggs): We may want a separate config for the model name in case it's different from the name used in the OpenAI API
     return create_remote_inference_engines(
         urls=cfg.generator.remote_inference_engine_urls,
         model_name=cfg.trainer.policy.model.path,
         engine_backend=cfg.generator.backend,
+        tokenizer=tokenizer,
         tensor_parallel_size=cfg.generator.inference_engine_tensor_parallel_size,
-        sampling_params=get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params),
+        data_parallel_size=cfg.generator.inference_engine_data_parallel_size,
+        expert_parallel_size=cfg.generator.inference_engine_expert_parallel_size,
     )
 
 
@@ -108,10 +119,10 @@ class BasePPOExp:
             PromptDataset: The training dataset.
         """
         prompts_dataset = PromptDataset(
-            self.cfg.data.train_data,
-            self.tokenizer,
-            self.cfg.trainer.max_prompt_length,
-            num_processors=8,
+            datasets=self.cfg.data.train_data,
+            tokenizer=self.tokenizer,
+            max_prompt_length=self.cfg.trainer.max_prompt_length,
+            num_workers=8,
         )
         # make sure the dataset is large enough to train on
         assert (
@@ -127,15 +138,15 @@ class BasePPOExp:
         """
         if self.cfg.trainer.eval_interval > 0 and self.cfg.data.val_data:
             prompts_dataset = PromptDataset(
-                self.cfg.data.val_data,
-                self.tokenizer,
-                self.cfg.trainer.max_prompt_length,
-                num_processors=8,
+                datasets=self.cfg.data.val_data,
+                tokenizer=self.tokenizer,
+                max_prompt_length=self.cfg.trainer.max_prompt_length,
+                num_workers=8,
             )
             return prompts_dataset
         return None
 
-    def get_colocate_pg(self, timeout: int = 180) -> PlacementGroup:
+    def get_colocate_pg(self, timeout: int = SKYRL_RAY_PG_TIMEOUT_IN_S) -> PlacementGroup:
         """Initializes a placement group for colocated training.
 
         A single placement group that packs all the inference engines together is created.
@@ -150,7 +161,8 @@ class BasePPOExp:
             pg = placement_group(
                 [{"GPU": 1, "CPU": 1}]
                 * self.cfg.generator.num_inference_engines
-                * self.cfg.generator.inference_engine_tensor_parallel_size,
+                * self.cfg.generator.inference_engine_tensor_parallel_size
+                * self.cfg.generator.inference_engine_data_parallel_size,
                 strategy="PACK",
             )
             get_ray_pg_ready_with_timeout(pg, timeout=timeout)
@@ -210,7 +222,7 @@ class BasePPOExp:
         return Tracking(
             project_name=self.cfg.trainer.project_name,
             experiment_name=self.cfg.trainer.run_name,
-            default_backend=self.cfg.trainer.logger,
+            backends=self.cfg.trainer.logger,
             config=self.cfg,
         )
 
@@ -231,10 +243,11 @@ class BasePPOExp:
                 PolicyWorker,
                 CriticWorker,
                 RefWorker,
-                RewardWorker,
             )
         elif self.cfg.trainer.strategy in ("fsdp", "fsdp2"):
-            from skyrl_train.workers.fsdp.fsdp_worker import PolicyWorker, CriticWorker, RefWorker, RewardWorker
+            from skyrl_train.workers.fsdp.fsdp_worker import PolicyWorker, CriticWorker, RefWorker
+        elif self.cfg.trainer.strategy == "megatron":
+            from skyrl_train.workers.megatron.megatron_worker import PolicyWorker, CriticWorker, RefWorker
         else:
             raise ValueError(f"Unknown strategy type: {self.cfg.trainer.strategy}")
 
@@ -246,9 +259,9 @@ class BasePPOExp:
         if self.cfg.generator.run_engines_locally:
             inference_engines = create_ray_wrapped_inference_engines_from_config(self.cfg, self.colocate_pg, tokenizer)
         else:
-            inference_engines = create_remote_inference_engines_from_config(self.cfg)
+            inference_engines = create_remote_inference_engines_from_config(self.cfg, tokenizer)
 
-        inference_engine_client = InferenceEngineClient(inference_engines)
+        inference_engine_client = InferenceEngineClient(inference_engines, tokenizer, self.cfg)
 
         generator: GeneratorInterface = self.get_generator(self.cfg, tokenizer, inference_engine_client)
 
@@ -264,7 +277,7 @@ class BasePPOExp:
         )
 
         # Build the models
-        trainer.build_models(PolicyWorker, CriticWorker, RefWorker, RewardWorker)
+        trainer.build_models(PolicyWorker, CriticWorker, RefWorker)
         return trainer
 
     def run(self):

@@ -6,9 +6,11 @@ import ray
 import pytest
 import hydra
 from omegaconf import DictConfig
+import os
+import shutil
 
-from tests.gpu.utils import init_worker_with_type, make_dummy_experience, make_dummy_tensorbatch
-from skyrl_train.utils.utils import print_mem
+from tests.gpu.utils import init_worker_with_type, make_dummy_experience, make_dummy_tensorbatch, get_rank_0_memory
+from skyrl_train.utils.utils import validate_cfg
 from skyrl_train.entrypoints.main_base import config_dir
 from skyrl_train.training_batch import TrainingOutputBatch
 
@@ -22,6 +24,9 @@ def get_test_actor_config() -> DictConfig:
     cfg.trainer.policy.model.path = MODEL_NAME
     cfg.trainer.placement.policy_num_gpus_per_node = 2
     cfg.trainer.use_sample_packing = False
+    cfg.trainer.logger = "console"
+
+    validate_cfg(cfg)
 
     return cfg
 
@@ -29,12 +34,6 @@ def get_test_actor_config() -> DictConfig:
 @pytest.fixture
 def cfg() -> DictConfig:
     return get_test_actor_config()
-
-
-def get_rank_0_memory(actor_group, message: str):
-    mem = ray.get(actor_group.async_run_ray_method("pass_through", "get_cuda_memory"))[0]
-    print_mem(message, mem)
-    return mem["allocated"]
 
 
 @pytest.mark.asyncio
@@ -108,9 +107,20 @@ async def test_critic_policy_offload_memory_and_correctness(cfg, worker_type, st
         after_training = get_rank_0_memory(actor_group, "After training")
 
         # Offload model to CPU
-        actor_group.offload_to_cpu()
+        actor_group.offload_to_cpu(offload_optimizer=True, offload_model=False)
+        after_offload_optimizer = get_rank_0_memory(actor_group, "After optimizer offload")
 
-        after_offload = get_rank_0_memory(actor_group, "After offload")
+        assert (
+            after_offload_optimizer < after_training
+        ), f"Memory after offload optimizer should be less than after training: {after_offload_optimizer} bytes, after training: {after_training} bytes"
+
+        actor_group.offload_to_cpu(offload_optimizer=False, offload_model=True)
+        after_offload = get_rank_0_memory(actor_group, "After model offload")
+
+        if strategy != "deepspeed":  # deepspeed currently just supports offloading optimizer
+            assert (
+                after_offload < after_offload_optimizer
+            ), f"Memory after offload model should be less than after offload optimizer: {after_offload} bytes, after offload optimizer: {after_offload_optimizer} bytes"
 
         # check that allocated memory is similar to initial offload memory
         delta = abs(initial_offload_mem - after_offload)
@@ -125,9 +135,18 @@ async def test_critic_policy_offload_memory_and_correctness(cfg, worker_type, st
         ), f"Memory after offloading should be less than after forward pass: {delta_forward} bytes"
 
         # Backload model to GPU
-        actor_group.backload_to_gpu()
+        actor_group.backload_to_gpu(backload_optimizer=True, backload_model=False)
+        after_backload_optimizer = get_rank_0_memory(actor_group, "After backload optimizer")
+        assert (
+            after_backload_optimizer > after_offload
+        ), f"Memory after backload optimizer should be greater than after offload: {after_backload_optimizer} bytes, after offload: {after_offload} bytes"
 
-        get_rank_0_memory(actor_group, "After backload")
+        actor_group.backload_to_gpu(backload_optimizer=False, backload_model=True)
+        after_backload = get_rank_0_memory(actor_group, "After backload model")
+        if strategy != "deepspeed":  # deepspeed currently just supports offloading optimizer
+            assert (
+                after_backload > after_backload_optimizer
+            ), f"Memory after backload model should be greater than after backload optimizer: {after_backload} bytes, after backload optimizer: {after_backload_optimizer} bytes"
 
         # Run training again and ensure output consistency
         results_backload = ray.get(
@@ -288,3 +307,73 @@ async def test_cpu_offload_correctness(cfg, worker_type, strategy):
 
     finally:
         ray.shutdown()
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        "deepspeed",
+        "fsdp",
+        "fsdp2",
+    ],
+)
+def test_offload_after_ckpt(strategy):
+    """
+    Test ckpt+offload logic by:
+    1. Creating model and doing one training step
+    2. Saving checkpoint
+    3. Offload parameters and optimizer
+    4. Ensure that memory was freed
+    """
+    cfg = get_test_actor_config()
+    ckpt_path = "$HOME/ckpts/test/"
+    cfg.trainer.ckpt_path = ckpt_path
+    cfg.trainer.export_path = ckpt_path
+    cfg.trainer.strategy = strategy
+
+    checkpoint_dir = None
+    try:
+        actor_group = init_worker_with_type(
+            "policy",
+            shared_pg=None,
+            colocate_all=False,
+            num_gpus_per_node=cfg.trainer.placement.policy_num_gpus_per_node,
+            cfg=cfg,
+        )
+        get_rank_0_memory(actor_group, "After init")
+
+        # Create dummy experiences for training steps
+        dummy_experience_1 = make_dummy_experience()  # First training step
+        global_step, local_step, accumulation_steps = 0, 0, 1
+
+        # Step 1: Do initial training step
+        ray.get(
+            actor_group.async_run_ray_method(
+                "pass_through", "training_step", dummy_experience_1, global_step, local_step, accumulation_steps
+            )
+        )
+        get_rank_0_memory(actor_group, "After training step 1")
+
+        checkpoint_path = os.path.expandvars(os.path.join(cfg.trainer.ckpt_path, "global_step_1", "policy"))
+        checkpoint_dir = os.path.expandvars(os.path.join(cfg.trainer.ckpt_path, "global_step_1"))  # Store for cleanup
+
+        # Step 2: Save checkpoint
+        ray.get(actor_group.async_run_ray_method("pass_through", "save_checkpoint", ckpt_dir=checkpoint_path))
+        after_training = get_rank_0_memory(actor_group, "After ckpt")
+
+        # Step 3:Offload model to CPU
+        actor_group.offload_to_cpu()
+        after_offload = get_rank_0_memory(actor_group, "After offload")
+
+        # Step 4: Check that memory is offloaded
+        offload_delta = after_training - after_offload
+        assert offload_delta > 2.5 * 1024**3, f"Offload memory is {offload_delta} bytes, should be > 2.5GB"
+
+    finally:
+        # Clean up ray
+        ray.shutdown()
+
+        # Clean up checkpoint directory
+        if checkpoint_dir and os.path.exists(checkpoint_dir):
+            print(f"Removing checkpoint directory: {checkpoint_dir}")
+            shutil.rmtree(checkpoint_dir)

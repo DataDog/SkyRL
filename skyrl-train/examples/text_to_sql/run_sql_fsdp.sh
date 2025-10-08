@@ -42,7 +42,7 @@ uv run --isolated --extra vllm -m skyrl_train.entrypoints.main_base \
   trainer.policy.optimizer_config.lr=1.0e-6 \
   trainer.policy_mini_batch_size=256 \
   trainer.algorithm.use_kl_loss=false \
-  trainer.algorithm.ppo_loss_type="dual_clip" \
+  trainer.algorithm.policy_loss_type="dual_clip" \
   trainer.ckpt_interval=5 \
   trainer.hf_save_interval=5 \
   trainer.export_path=$HOME/export/ \
@@ -57,9 +57,10 @@ uv run --isolated --extra vllm -m skyrl_train.entrypoints.main_base \
   generator.n_samples_per_prompt=5 \
   generator.gpu_memory_utilization=0.7 \
   generator.max_turns=6 \
-  generator.use_conversation_multi_turn=false \
   generator.sampling_params.temperature=0.6 \
   generator.sampling_params.top_p=0.95 \
+  generator.sampling_params.stop='["</sql>", "</solution>"]' \
+  generator.eval_sampling_params.stop='["</sql>", "</solution>"]' \
   trainer.seed=1234 \
   environment.skyrl_gym.text2sql.db_path=$DB_PATH \
   trainer.logger="wandb" \
