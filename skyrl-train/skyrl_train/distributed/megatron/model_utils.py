@@ -18,29 +18,39 @@
 
 from typing import Any, Optional
 
+import megatron.core.parallel_state as mpu
 import torch
 import torch.distributed as dist
-import megatron.core.parallel_state as mpu
+
+
+@torch.compile(dynamic=True)
+def sum_exp(tensor: torch.Tensor) -> torch.Tensor:
+    # Compiled without assigning an intermediary tensor, is reduced right away
+    return tensor.exp().sum(-1, keepdim=True).float()
 
 
 @torch.no_grad()
 def _compute_distributed_log_softmax(
-    vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
+    vocab_parallel_logits: torch.Tensor,
+    group: torch.distributed.ProcessGroup,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Compute a stable distributed log softmax across tensor parallel workers.
 
-    Taken from: https://github.com/NVIDIA/NeMo-Aligner/blob/9faab404f21994a7eb1d6ed5890b76152b941636/nemo_aligner/utils/distributed.py#L265
+    In-place modification of code from: https://github.com/NVIDIA/NeMo-Aligner/blob/9faab404f21994a7eb1d6ed5890b76152b941636/nemo_aligner/utils/distributed.py#L265
 
     Args:
         vocab_parallel_logits (torch.Tensor): Logits tensor with shape [batch_size, seq_length, vocab_size//TP]
             where TP is the tensor parallel size.
         group (torch.distributed.ProcessGroup): Process group for the all-reduce operations.
+        dtype (torch.dtype): Data type the softmax will be computed in.
 
     Returns:
         torch.Tensor: Log softmax output with the same shape as input, but values represent
             log probabilities normalized across the full vocabulary dimension.
     """
-    logits_max = torch.amax(vocab_parallel_logits, dim=-1, keepdim=True)
+    logits = torch.tensor(vocab_parallel_logits, dtype=dtype, device=vocab_parallel_logits.device)
+    logits_max = torch.amax(logits, dim=-1, keepdim=True)
     torch.distributed.all_reduce(
         logits_max,
         op=torch.distributed.ReduceOp.MAX,
@@ -48,9 +58,9 @@ def _compute_distributed_log_softmax(
     )
 
     # Subtract the maximum value.
-    vocab_parallel_logits = vocab_parallel_logits - logits_max
+    logits.sub_(logits_max)
 
-    sum_exp_logits = vocab_parallel_logits.exp().sum(-1, keepdim=True).float()
+    sum_exp_logits = sum_exp(logits)
 
     torch.distributed.all_reduce(
         sum_exp_logits,
@@ -58,7 +68,7 @@ def _compute_distributed_log_softmax(
         group=group,
     )
 
-    return vocab_parallel_logits - sum_exp_logits.log_().to(vocab_parallel_logits.dtype)
+    return logits.sub_(sum_exp_logits.log_().to(dtype))
 
 
 class DistributedLogprob(torch.autograd.Function):
@@ -82,12 +92,9 @@ class DistributedLogprob(torch.autograd.Function):
         masked_target = target - vocab_start_index
         masked_target[target_mask] = 0
 
-        vocab_parallel_logits = vocab_parallel_logits.to(dtype=torch.float32)
+        ungathered_log_probs = _compute_distributed_log_softmax(vocab_parallel_logits, group=group)
 
-        log_probs = _compute_distributed_log_softmax(vocab_parallel_logits, group=group)
-        softmax_output = log_probs.exp()
-
-        log_probs = torch.gather(log_probs, -1, masked_target.unsqueeze(-1)).squeeze(-1)
+        log_probs = torch.gather(ungathered_log_probs, -1, masked_target.unsqueeze(-1)).squeeze(-1)
         log_probs[target_mask] = 0.0
 
         torch.distributed.all_reduce(
@@ -98,6 +105,7 @@ class DistributedLogprob(torch.autograd.Function):
 
         if not inference_only:
             # only save for backward when we have inference only=False
+            softmax_output = ungathered_log_probs.exp_()
             ctx.save_for_backward(softmax_output, target_mask, masked_target)
 
         return log_probs
@@ -172,8 +180,6 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
 
             logits = vocab_parallel_logits[:, chunk_start:chunk_end, :]
-            logits = logits.to(dtype=torch.float32)
-
             log_probs = _compute_distributed_log_softmax(
                 logits,
                 group=tp_group,
@@ -221,8 +227,6 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
 
             logits = vocab_parallel_logits[:, chunk_start:chunk_end, :]
-            logits = logits.to(dtype=torch.float32)
-
             softmax_output = _compute_distributed_log_softmax(
                 logits,
                 group=tp_group,
