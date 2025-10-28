@@ -375,6 +375,10 @@ def preprocess_packed_seqs(
     else:
         return input_ids, packed_seq_params
 
+@torch.compile(dynamic=True)
+def flip_assign(tensor: torch.Tensor, indices: torch.Tensor, values: torch.Tensor):
+    tensor[indices] = values
+    return tensor
 
 def postprocess_packed_seqs(
     output: torch.Tensor,
@@ -401,38 +405,36 @@ def postprocess_packed_seqs(
     output_new = torch.zeros(shape, dtype=output.dtype, device=output.device)
 
     cp_size = mpu.get_context_parallel_world_size()
-    # all gather output across context parallel group
-    if cp_size > 1:
-        # output shape: [1, packed_len, hidden_dim]
-        # need to gather across cp group and concatenate in sequence dimension
-        output_block = torch.empty((cp_size, *output.shape), dtype=output.dtype, device=output.device)
-        torch.distributed.all_gather_into_tensor(output_block, output.detach(), group=mpu.get_context_parallel_group())
-        output_list = [output_block[i] if i != mpu.get_context_parallel_rank() else output for i in range(cp_size)]
-    else:
-        output_list = [output]
-    for i in range(batch_size):
-        if cp_size <= 1:
+    cp_rank = mpu.get_context_parallel_rank()
+    if cp_size <= 1:
+        for i in range(batch_size):
             s = seq_lens_cpu[i]
             start_idx = cu_padded_cpu[i]
             output_new[i, attention_mask[i]] = output[0][start_idx : start_idx + s]
-            continue
+        return output_new
+    for i in range(batch_size):
         s_len_padded_chunk = (cu_padded_cpu[i + 1] - cu_padded_cpu[i]) // cp_size
         half_seqlen = s_len_padded_chunk // 2
         s_len = seq_lens_cpu[i]
-        s_len_padded = s_len_padded_chunk * cp_size
-        tmp = torch.empty(s_len_padded, *output.shape[2:], device=output.device)
-        for j in range(cp_size):
-            o = output_list[j][0]
-            # split to 2 chunks
-            packed_start_idx = cu_padded_cpu[i] // cp_size
-            o0, o1 = (
-                o[packed_start_idx : packed_start_idx + half_seqlen],
-                o[packed_start_idx + half_seqlen : packed_start_idx + s_len_padded_chunk],
-            )
-            tmp[j * half_seqlen : (j + 1) * half_seqlen] = o0
-            tmp[s_len_padded - (j + 1) * half_seqlen : s_len_padded - j * half_seqlen] = o1
-        output_new[i, attention_mask[i]] = tmp[:s_len]
+        packed_start_idx = cu_padded_cpu[i] // cp_size
+        half_total_len = half_seqlen * cp_size
+        attention_indices = attention_mask[i].nonzero().squeeze(-1)
 
+        if s_len > half_total_len:
+            output_chunk_right = output[0][packed_start_idx + half_seqlen : packed_start_idx + s_len_padded_chunk]
+            output_right = torch.empty(cp_size, half_seqlen, *output.shape[2:], device=output.device)
+            torch.distributed.all_gather_into_tensor(output_right, output_chunk_right.unsqueeze(0).detach(), group=mpu.get_context_parallel_group())
+            output_right[cp_rank] = output_chunk_right
+            chunked_reversed_indices = torch.nn.functional.pad(attention_indices[half_total_len:], (0, 2 * half_total_len - s_len), value=0).view(cp_size, -1).flip(0).reshape(-1)
+            output_new[i, chunked_reversed_indices] = output_right.flatten(0, 1)
+            del output_right, output_chunk_right
+
+        output_chunk_left = output[0][packed_start_idx : packed_start_idx + half_seqlen]
+        output_left = torch.empty(cp_size, half_seqlen, *output.shape[2:], device=output.device)
+        torch.distributed.all_gather_into_tensor(output_left, output_chunk_left.unsqueeze(0).detach(), group=mpu.get_context_parallel_group())
+        output_left[cp_rank] = output_chunk_left
+        output_new[i, attention_indices[:half_total_len]] = output_left.flatten(0, 1)[:min(s_len, half_total_len)]
+        del output_left, output_chunk_left
     return output_new
 
 
