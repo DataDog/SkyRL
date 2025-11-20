@@ -398,6 +398,7 @@ def postprocess_packed_seqs(
     seq_lens_cpu: list[int] = attention_mask.sum(dim=1, dtype=torch.int32).cpu().tolist()
 
     shape = [batch_size, seq_len] + list(output.shape[2:])  # 1,packed, dim -> batch_size, seq_len, dim
+    print(f"postprocess shape: {shape}")
     output_new = torch.zeros(shape, dtype=output.dtype, device=output.device)
 
     cp_size = mpu.get_context_parallel_world_size()
@@ -405,9 +406,9 @@ def postprocess_packed_seqs(
     if cp_size > 1:
         # output shape: [1, packed_len, hidden_dim]
         # need to gather across cp group and concatenate in sequence dimension
-        output_list = [torch.empty_like(output) for _ in range(cp_size)]
-        torch.distributed.all_gather(output_list, output.detach(), group=mpu.get_context_parallel_group())
-        output_list[mpu.get_context_parallel_rank()] = output
+        output_block = torch.empty((cp_size, *output.shape), dtype=output.dtype, device=output.device)
+        torch.distributed.all_gather_into_tensor(output_block, output.detach(), group=mpu.get_context_parallel_group())
+        output_list = [output_block[i] if i != mpu.get_context_parallel_rank() else output for i in range(cp_size)]
     else:
         output_list = [output]
     for i in range(batch_size):
