@@ -288,33 +288,36 @@ def create_ray_wrapped_inference_engines(
 
                 os.environ["CUDA_VISIBLE_DEVICES"] = before_cuda_visible_devices
 
+                from skyrl_train.utils.io import io
+
                 actor_class = SGLangRayActor
-                engine = actor_class.options(
-                    num_cpus=num_gpus_per_actor,
-                    num_gpus=num_gpus_per_actor,
-                    scheduling_strategy=scheduling_strategy,
-                ).remote(
-                    model_path=pretrain,
-                    tp_size=tensor_parallel_size,
-                    mem_fraction_static=gpu_memory_utilization,
-                    random_seed=seed + i,
-                    disable_radix_cache=not enable_prefix_caching,
-                    dtype=model_dtype,
-                    trust_remote_code=True,
-                    max_prefill_tokens=max_num_batched_tokens,
-                    max_running_requests=max_num_seqs,
-                    # Borrowed from veRL's SGLang rollout
-                    mm_attention_backend="fa3",
-                    attention_backend="fa3",
-                    enable_memory_saver=inference_engine_enable_sleep,
-                    # Will be popped before instantiating sgl.Engine
-                    distributed_executor_backend=distributed_executor_backend,
-                    noset_visible_devices=noset_visible_devices,
-                    bundle_indices=bundle_indices,
-                    num_gpus=0.2 if use_hybrid_engine else 1,
-                    tokenizer=tokenizer,
-                    **engine_init_kwargs,
-                )
+                with io.local_read_dir(pretrain) as local_pretrain:
+                    engine = actor_class.options(
+                        num_cpus=num_gpus_per_actor,
+                        num_gpus=num_gpus_per_actor,
+                        scheduling_strategy=scheduling_strategy,
+                    ).remote(
+                        model_path=local_pretrain,
+                        tp_size=tensor_parallel_size,
+                        mem_fraction_static=gpu_memory_utilization,
+                        random_seed=seed + i,
+                        disable_radix_cache=not enable_prefix_caching,
+                        dtype=model_dtype,
+                        trust_remote_code=True,
+                        max_prefill_tokens=max_num_batched_tokens,
+                        max_running_requests=max_num_seqs,
+                        # Borrowed from veRL's SGLang rollout
+                        mm_attention_backend="fa3",
+                        attention_backend="fa3",
+                        enable_memory_saver=inference_engine_enable_sleep,
+                        # Will be popped before instantiating sgl.Engine
+                        distributed_executor_backend=distributed_executor_backend,
+                        noset_visible_devices=noset_visible_devices,
+                        bundle_indices=bundle_indices,
+                        num_gpus=0.2 if use_hybrid_engine else 1,
+                        tokenizer=tokenizer,
+                        **engine_init_kwargs,
+                    )
                 return engine
 
             engine = ray.get(get_sglang_engine.remote())

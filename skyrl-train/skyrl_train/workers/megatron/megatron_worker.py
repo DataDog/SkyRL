@@ -197,53 +197,56 @@ class MegatronWorker:
         """
         Initialize the Megatron-Bridge bridge and provider objects + hf_config and tokenizer
         """
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        from skyrl_train.utils.io import io
 
-        override_config_kwargs = {
-            "bos_token_id": tokenizer.bos_token_id,
-            "eos_token_id": tokenizer.eos_token_id,
-            "pad_token_id": tokenizer.pad_token_id,
-        }
-        override_config_kwargs.update(model_config_kwargs.get("model_config", {}))
-        update_model_config(hf_config, override_config_kwargs=override_config_kwargs)
+        with io.local_read_dir(model_path) as model_path:
+            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
 
-        # if flash_attn is enabled, we use flash attention backend, otherwise fall back to fused attention backend
-        transformer_config_kwargs = (
-            transformer_config_kwargs
-            if isinstance(transformer_config_kwargs, dict)
-            else OmegaConf.to_container(transformer_config_kwargs, resolve=True)
-        )
-        transformer_config_kwargs["attention_backend"] = "flash" if flash_attn else "fused"
+            override_config_kwargs = {
+                "bos_token_id": tokenizer.bos_token_id,
+                "eos_token_id": tokenizer.eos_token_id,
+                "pad_token_id": tokenizer.pad_token_id,
+            }
+            override_config_kwargs.update(model_config_kwargs.get("model_config", {}))
+            update_model_config(hf_config, override_config_kwargs=override_config_kwargs)
 
-        if not self.cfg.trainer.gradient_checkpointing:
-            for key in ("recompute_granularity", "recompute_method", "recompute_num_layers"):
-                transformer_config_kwargs[key] = None
+            # if flash_attn is enabled, we use flash attention backend, otherwise fall back to fused attention backend
+            transformer_config_kwargs = (
+                transformer_config_kwargs
+                if isinstance(transformer_config_kwargs, dict)
+                else OmegaConf.to_container(transformer_config_kwargs, resolve=True)
+            )
+            transformer_config_kwargs["attention_backend"] = "flash" if flash_attn else "fused"
 
-        bridge = AutoBridge.from_hf_pretrained(model_path, trust_remote_code=True)
-        provider = bridge.to_megatron_provider()
-        provider.tensor_model_parallel_size = megatron_config.tensor_model_parallel_size
-        provider.pipeline_model_parallel_size = megatron_config.pipeline_model_parallel_size
-        provider.pipeline_dtype = torch.bfloat16 if bf16 else torch.float32
-        provider.context_parallel_size = megatron_config.context_parallel_size
-        provider.expert_model_parallel_size = megatron_config.expert_model_parallel_size
-        provider.expert_tensor_parallel_size = megatron_config.expert_tensor_parallel_size
-        provider.sequence_parallel = megatron_config.tensor_model_parallel_size > 1
-        provider.attention_backend = "flash" if flash_attn else "fused"
-        provider.variable_seq_lengths = True
-        provider.masked_softmax_fusion = True
-        provider.moe_token_dispatcher_type = "alltoall"
-        provider.moe_router_load_balancing_type = "none"
+            if not self.cfg.trainer.gradient_checkpointing:
+                for key in ("recompute_granularity", "recompute_method", "recompute_num_layers"):
+                    transformer_config_kwargs[key] = None
 
-        for k, v in transformer_config_kwargs.items():
-            setattr(provider, k, v)
-        provider.finalize()
+            bridge = AutoBridge.from_hf_pretrained(model_path, trust_remote_code=True)
+            provider = bridge.to_megatron_provider()
+            provider.tensor_model_parallel_size = megatron_config.tensor_model_parallel_size
+            provider.pipeline_model_parallel_size = megatron_config.pipeline_model_parallel_size
+            provider.pipeline_dtype = torch.bfloat16 if bf16 else torch.float32
+            provider.context_parallel_size = megatron_config.context_parallel_size
+            provider.expert_model_parallel_size = megatron_config.expert_model_parallel_size
+            provider.expert_tensor_parallel_size = megatron_config.expert_tensor_parallel_size
+            provider.sequence_parallel = megatron_config.tensor_model_parallel_size > 1
+            provider.attention_backend = "flash" if flash_attn else "fused"
+            provider.variable_seq_lengths = True
+            provider.masked_softmax_fusion = True
+            provider.moe_token_dispatcher_type = "alltoall"
+            provider.moe_router_load_balancing_type = "none"
 
-        self.provider = provider
-        self.bridge = bridge
+            for k, v in transformer_config_kwargs.items():
+                setattr(provider, k, v)
+            provider.finalize()
 
-        self.strategy.hf_config = hf_config
-        self.tokenizer = tokenizer
+            self.provider = provider
+            self.bridge = bridge
+
+            self.strategy.hf_config = hf_config
+            self.tokenizer = tokenizer
 
     def configure_lora(self, lora_config, lora_type: Optional[str] = "lora"):
         if lora_type == "lora":

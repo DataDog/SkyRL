@@ -94,6 +94,17 @@ class VLLMServerActor(ServerActorProtocol):
             nixl_side_channel_base: Base port for NIXL side channel
             colocated_training: Whether the server is colocated with training workers
         """
+        from skyrl_train.utils.io import io
+
+        self._cloud_model_ctx = None
+        if io.is_cloud_path(vllm_cli_args.model):
+            original_path = vllm_cli_args.model
+            self._cloud_model_ctx = io.local_read_dir(original_path)
+            local_path = self._cloud_model_ctx.__enter__()
+            vllm_cli_args.model = local_path
+            if not getattr(vllm_cli_args, "served_model_name", None):
+                vllm_cli_args.served_model_name = original_path
+
         self._cli_args = vllm_cli_args
         self._ip = get_node_ip()
         self._port = get_open_port(start_port)
