@@ -1,6 +1,6 @@
 # basic pyproject.toml for skyrl-gym
 [build-system]
-requires = ["setuptools>=45", "wheel"]
+requires = ["setuptools>=82.0.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
